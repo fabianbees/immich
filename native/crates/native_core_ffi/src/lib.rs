@@ -9,6 +9,7 @@ mod android;
 mod bitmap;
 #[cfg(target_os = "android")]
 mod convert;
+mod jpeg_xl;
 #[cfg(target_os = "android")]
 mod rotate;
 mod thumbhash;

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:ffi';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
@@ -8,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
 import 'package:immich_mobile/providers/infrastructure/platform.provider.dart';
+import 'package:native_core/native_core.dart' show JxlImage, decodeJxl, freeJxlPixels, isJxl;
 
 part 'local_image_request.dart';
 part 'remote_image_request.dart';
@@ -49,6 +51,10 @@ abstract class ImageRequest {
       return null;
     }
 
+    if (isJxl(address, length)) {
+      return _codecFromJxl(pointer, length, decodeSize: decodeSize);
+    }
+
     final ui.ImmutableBuffer buffer;
     try {
       buffer = await ImmutableBuffer.fromUint8List(pointer.asTypedList(length));
@@ -79,8 +85,41 @@ abstract class ImageRequest {
     return (codec, descriptor);
   }
 
+  // Flutter cannot decode JPEG XL, and the platform decoders only can on some OS versions.
+  Future<(ui.Codec, ui.ImageDescriptor)?> _codecFromJxl(
+    Pointer<Uint8> pointer,
+    int length, {
+    ui.Size? decodeSize,
+  }) async {
+    final image = await _decodeJxl(pointer.address, length).whenComplete(() => malloc.free(pointer));
+    if (image == null) {
+      throw const FormatException('Could not decode JPEG XL image');
+    }
+
+    if (_isCancelled) {
+      freeJxlPixels(image);
+      return null;
+    }
+
+    return _codecFromPixels(
+      Pointer<Uint8>.fromAddress(image.address),
+      width: image.width,
+      height: image.height,
+      rowBytes: image.rowBytes,
+      free: () => freeJxlPixels(image),
+      decodeSize: decodeSize,
+    );
+  }
+
+  // Static, so the closure sent to the isolate cannot capture the request.
+  static Future<JxlImage?> _decodeJxl(int address, int length) => Isolate.run(() => decodeJxl(address, length));
+
   Future<ui.FrameInfo?> _fromEncodedPlatformImage(int address, int length, {ui.Size? decodeSize}) async {
     final result = await _codecFromEncodedPlatformImage(address, length, decodeSize: decodeSize);
+    return _firstFrame(result);
+  }
+
+  Future<ui.FrameInfo?> _firstFrame((ui.Codec, ui.ImageDescriptor)? result) async {
     if (result == null) {
       return null;
     }
@@ -123,12 +162,30 @@ abstract class ImageRequest {
       return null;
     }
 
-    final size = rowBytes * height;
+    final result = await _codecFromPixels(
+      pointer,
+      width: width,
+      height: height,
+      rowBytes: rowBytes,
+      free: () => malloc.free(pointer),
+    );
+    return _firstFrame(result);
+  }
+
+  /// Wraps premultiplied RGBA [pixels] in a codec, calling [free] once they are copied.
+  Future<(ui.Codec, ui.ImageDescriptor)?> _codecFromPixels(
+    Pointer<Uint8> pixels, {
+    required int width,
+    required int height,
+    required int rowBytes,
+    required void Function() free,
+    ui.Size? decodeSize,
+  }) async {
     final ui.ImmutableBuffer buffer;
     try {
-      buffer = await ImmutableBuffer.fromUint8List(pointer.asTypedList(size));
+      buffer = await ImmutableBuffer.fromUint8List(pixels.asTypedList(rowBytes * height));
     } finally {
-      malloc.free(pointer);
+      free();
     }
 
     if (_isCancelled) {
@@ -145,21 +202,14 @@ abstract class ImageRequest {
     );
     buffer.dispose();
 
-    final codec = await descriptor.instantiateCodec();
+    final target = _targetSize(width, height, decodeSize);
+    final codec = await descriptor.instantiateCodec(targetWidth: target?.$1, targetHeight: target?.$2);
     if (_isCancelled) {
       descriptor.dispose();
       codec.dispose();
       return null;
     }
 
-    final frame = await codec.getNextFrame();
-    descriptor.dispose();
-    codec.dispose();
-    if (_isCancelled) {
-      frame.image.dispose();
-      return null;
-    }
-
-    return frame;
+    return (codec, descriptor);
   }
 }

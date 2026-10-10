@@ -1,4 +1,5 @@
 pub mod convert;
+pub mod jpeg_xl;
 pub mod rotate;
 pub mod thumbhash;
 

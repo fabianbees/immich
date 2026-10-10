@@ -6,3 +6,6 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+jxl = "0.7.4"
